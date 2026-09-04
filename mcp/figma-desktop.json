@@ -1,0 +1,6 @@
+{
+  "figma": {
+    "type": "http",
+    "url": "http://host.docker.internal:3845/mcp"
+  }
+}

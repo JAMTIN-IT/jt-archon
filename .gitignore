@@ -1,0 +1,21 @@
+# Your configuration and credentials. Never commit this.
+.env
+
+# Local compose tweaks (Compose merges this automatically if present).
+docker-compose.override.yml
+
+# Web UI password hash, written by `./archon password`.
+# caddy/auth.conf.example is tracked; the live file is created from it by
+# `./archon init` (and auto-created by `./archon up` if it went missing).
+caddy/auth.conf
+
+# GitHub App private key, if you use App mode.
+*.pem
+
+# Local data, if you point ARCHON_DATA/ARCHON_USER_HOME at a path in here.
+data/
+user-home/
+
+# Generated from .env by ./archon up|restart. Holds your environment's
+# project ref, never a secret - the token stays a $VAR expanded at run time.
+mcp/*.local.json

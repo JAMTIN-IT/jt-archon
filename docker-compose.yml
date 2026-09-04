@@ -1,0 +1,158 @@
+# =============================================================================
+# Archon Portable — one stack, three access modes, any OS with Docker.
+# =============================================================================
+#
+#   COMPOSE_PROFILES=local   ->  Web UI on 127.0.0.1 only (default, safest)
+#   COMPOSE_PROFILES=lan     ->  Web UI on your LAN IP behind a password
+#   COMPOSE_PROFILES=public  ->  Web UI on a public domain with automatic HTTPS
+#
+# Append ",db" to any mode to also run PostgreSQL (e.g. "lan,db").
+# COMPOSE_PROFILES lives in .env, so a plain `docker compose up -d` honours it.
+# The ./archon launcher is a thin convenience wrapper over these same profiles.
+#
+# "local" is deliberately a no-op profile: no service declares it, and the `app`
+# service declares no profile at all, so `app` runs in every mode.
+# =============================================================================
+
+name: ${COMPOSE_PROJECT_NAME:-archon}
+
+services:
+  # ---------------------------------------------------------------------------
+  # Archon server + Web UI. Always runs.
+  # ---------------------------------------------------------------------------
+  app:
+    image: ${ARCHON_IMAGE:-ghcr.io/coleam00/archon}:${ARCHON_VERSION:-latest}
+    pull_policy: ${ARCHON_PULL_POLICY:-missing}
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      ARCHON_DOCKER: "true"
+      # Pinned deliberately. This is the bind INSIDE the container's network
+      # namespace and is not a security boundary — what the host exposes is
+      # controlled by ARCHON_APP_BIND below. Setting HOST=127.0.0.1 in .env
+      # would make the published port unreachable and break the Caddy modes.
+      HOST: "0.0.0.0"
+      PORT: "${PORT:-3000}"
+      # Bind-mounted host code appears owned by root inside the container, and
+      # git refuses ("dubious ownership") any repo owned by another user — which
+      # you cannot chown away on Windows/macOS bind mounts. Without this, adding
+      # a local codebase fails with "Could not determine whether the path is a
+      # git repository". Passed as env config rather than written into
+      # ~/.gitconfig so it applies to every git subprocess with no volume state.
+      # Widen GIT_SAFE_DIRS to "*" if your repos sit more than one level under
+      # PROJECTS_DIR (the glob matches a single level).
+      GIT_CONFIG_COUNT: "1"
+      GIT_CONFIG_KEY_0: "safe.directory"
+      GIT_CONFIG_VALUE_0: "${GIT_SAFE_DIRS:-/projects/*}"
+    ports:
+      # Default 127.0.0.1: reachable from this machine only. In lan/public mode
+      # Caddy is what teammates hit; this stays as a local debugging door.
+      - "${ARCHON_APP_BIND:-127.0.0.1}:${PORT:-3000}:${PORT:-3000}"
+    volumes:
+      - ${ARCHON_DATA:-archon_data}:/.archon
+      - ${ARCHON_USER_HOME:-archon_user_home}:/home/appuser
+      # Shared MCP server definitions, referenced from workflows by absolute
+      # path (e.g. mcp: /opt/archon-mcp/figma-desktop.json). See mcp/README.md.
+      - ./mcp:/opt/archon-mcp:ro
+      # Your local code. Archon resolves codebase paths INSIDE the container, so
+      # a folder project has to be visible here or it cannot be registered:
+      # a host path like C:\code\app is not a path the container can see.
+      # Point PROJECTS_DIR at the folder holding your repos; each one is then
+      # at /projects/<name>, which is what you type in the Web UI.
+      - ${PROJECTS_DIR:-./projects}:/projects
+    extra_hosts:
+      # Lets the container reach servers running on the host — required for
+      # Figma Desktop's MCP server. Implicit on Docker Desktop, required on Linux.
+      - "host.docker.internal:host-gateway"
+    networks: [archon]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:${PORT:-3000}/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+  # ---------------------------------------------------------------------------
+  # LAN gateway: password-gated Web UI on your local network. Profile: lan
+  # ---------------------------------------------------------------------------
+  caddy-lan:
+    image: caddy:2-alpine
+    profiles: ["lan"]
+    restart: unless-stopped
+    environment:
+      PORT: "${PORT:-3000}"
+    ports:
+      - "${LAN_BIND:-0.0.0.0}:${LAN_PORT:-8080}:8080"
+    volumes:
+      - ./caddy/Caddyfile.lan:/etc/caddy/Caddyfile:ro
+      # Password gate. Regenerate with `./archon password '<new password>'`.
+      # Kept in a file, not .env: Compose interpolates .env and would eat the
+      # `$` characters that every bcrypt hash contains.
+      - ./caddy/auth.conf:/etc/caddy/auth.conf:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    networks: [archon]
+    depends_on:
+      app:
+        condition: service_healthy
+
+  # ---------------------------------------------------------------------------
+  # Public gateway: real domain + automatic Let's Encrypt TLS. Profile: public
+  # ---------------------------------------------------------------------------
+  caddy-public:
+    image: caddy:2-alpine
+    profiles: ["public"]
+    restart: unless-stopped
+    environment:
+      PORT: "${PORT:-3000}"
+      # `./archon up public` refuses to start unless this is a real domain.
+      DOMAIN: "${DOMAIN:-archon.example.com}"
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./caddy/Caddyfile.public:/etc/caddy/Caddyfile:ro
+      - ./caddy/auth.conf:/etc/caddy/auth.conf:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    networks: [archon]
+    depends_on:
+      app:
+        condition: service_healthy
+
+  # ---------------------------------------------------------------------------
+  # PostgreSQL. Profile: db
+  # Only needed for heavy parallel use (20+ concurrent workflows) or for
+  # Better Auth per-user login. SQLite is the zero-config default otherwise.
+  # Remember to also set DATABASE_URL in .env — see .env.example.
+  # ---------------------------------------------------------------------------
+  postgres:
+    image: postgres:17-alpine
+    profiles: ["db"]
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: remote_coding_agent
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+    ports:
+      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks: [archon]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  archon_data:
+  archon_user_home:
+  postgres_data:
+  caddy_data:
+  caddy_config:
+
+networks:
+  archon:
+    driver: bridge

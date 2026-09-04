@@ -1,0 +1,10 @@
+# Archon Web UI password gate — imported by both Caddyfiles.
+#
+# This file is EMPTY by default, which means NO PASSWORD is required.
+# Generate a real gate (never hand-edit this file):
+#
+#     ./archon password 'your-password-here'      # macOS / Linux / Git Bash
+#     .\archon.ps1 password 'your-password-here'  # Windows PowerShell
+#
+# That writes a bcrypt hash below. A hash is not a plaintext password, but it
+# is still a credential — do not publish this file.

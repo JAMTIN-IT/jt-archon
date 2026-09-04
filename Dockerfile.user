@@ -1,0 +1,58 @@
+# =============================================================================
+# Optional: Archon + extra tooling.
+# =============================================================================
+# You do NOT need this to run Archon. The stock image works out of the box.
+#
+# Build it when you want stdio MCP servers that insist on Node/npx, or any
+# other tool your workflows shell out to. `./archon build` builds this image
+# and repoints .env at it; reset ARCHON_IMAGE/ARCHON_VERSION in .env to go back.
+#
+# Everything below is additive - the Archon runtime, Claude Code, gh, ripgrep,
+# jq, Chromium and agent-browser all come from the base image untouched.
+# =============================================================================
+
+ARG ARCHON_VERSION=latest
+FROM ghcr.io/coleam00/archon:${ARCHON_VERSION}
+
+USER root
+
+# Node.js LTS (brings npm and npx). The base image is Bun-based and purges npm
+# after its own build, so `npx`-based MCP servers cannot start without this -
+# the `node` already on PATH there is only Bun's wrapper. Most npm MCP servers
+# run fine under `bunx`, so try that before rebuilding.
+RUN set -eux; \
+    ARCH="$(dpkg --print-architecture)"; \
+    case "$ARCH" in \
+      amd64) NODE_ARCH=x64 ;; \
+      arm64) NODE_ARCH=arm64 ;; \
+      *) echo "unsupported architecture: $ARCH" >&2; exit 1 ;; \
+    esac; \
+    NODE_VERSION=22.20.0; \
+    # .tar.gz, not the .tar.xz nodejs.org lists first: the base image has no
+    # `xz` binary, so tar cannot unpack an xz archive there.
+    curl -fsSL "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-${NODE_ARCH}.tar.gz" \
+      -o /tmp/node.tar.gz; \
+    tar -xzf /tmp/node.tar.gz -C /usr/local --strip-components=1 \
+      --exclude=CHANGELOG.md --exclude=LICENSE --exclude=README.md; \
+    rm /tmp/node.tar.gz; \
+    node --version; npm --version; npx --version
+
+# --- Add your own tools below -----------------------------------------------
+
+# Extra apt packages your workflows call:
+# RUN apt-get update && apt-get install -y --no-install-recommends \
+#       fd-find tree \
+#     && rm -rf /var/lib/apt/lists/*
+
+# Python, if a workflow needs it:
+# RUN apt-get update && apt-get install -y --no-install-recommends \
+#       python3 python3-pip \
+#     && rm -rf /var/lib/apt/lists/*
+
+# Pre-install an MCP server so the first workflow run isn't slowed by a fetch:
+# RUN npm install -g @modelcontextprotocol/server-filesystem
+
+# gh CLI extensions (gh itself is already in the base image):
+# RUN gh extension install github/gh-copilot
+
+USER appuser

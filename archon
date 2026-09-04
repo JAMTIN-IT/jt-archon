@@ -1,0 +1,684 @@
+#!/usr/bin/env bash
+# =============================================================================
+# archon - launcher for Archon Portable (macOS / Linux / WSL / Git Bash)
+# Windows PowerShell users: use .\archon.ps1 with the same commands.
+# =============================================================================
+set -euo pipefail
+
+cd "$(dirname "$0")"
+
+ENV_FILE=".env"
+AUTH_FILE="caddy/auth.conf"
+
+# caddy/auth.conf holds a credential, so it is gitignored and absent from a
+# fresh clone. Docker would silently create a DIRECTORY at that mount path,
+# so materialise it from the tracked example before anything touches it.
+[ -f "$AUTH_FILE" ] || [ ! -f "$AUTH_FILE.example" ] || cp "$AUTH_FILE.example" "$AUTH_FILE"
+
+# --- output ------------------------------------------------------------------
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
+  B=$'\033[1m'; DIM=$'\033[2m'; R=$'\033[31m'; G=$'\033[32m'; Y=$'\033[33m'; C=$'\033[36m'; X=$'\033[0m'
+else
+  B=""; DIM=""; R=""; G=""; Y=""; C=""; X=""
+fi
+say()  { printf '%s\n' "$*"; }
+ok()   { printf '%s\n' "${G}✓${X} $*"; }
+warn() { printf '%s\n' "${Y}!${X} $*" >&2; }
+die()  { printf '%s\n' "${R}✗${X} $*" >&2; exit 1; }
+
+# --- docker ------------------------------------------------------------------
+have() { command -v "$1" >/dev/null 2>&1; }
+
+dc() {
+  if have docker && docker compose version >/dev/null 2>&1; then
+    docker compose "$@"
+  elif have docker-compose; then
+    docker-compose "$@"
+  else
+    die "Docker Compose not found. Install Docker Desktop (Windows/macOS) or the docker-compose-plugin (Linux)."
+  fi
+}
+
+require_docker() {
+  have docker || die "docker is not installed or not on PATH. See https://docs.docker.com/get-docker/"
+  docker info >/dev/null 2>&1 || die "The Docker daemon is not reachable. Start Docker Desktop (or 'sudo systemctl start docker') and retry."
+}
+
+# --- .env helpers ------------------------------------------------------------
+require_env() {
+  [ -f "$ENV_FILE" ] || die "No .env yet. Run '${B}./archon init${X}' first."
+}
+
+# Read a key. Ignores commented-out lines. Strips surrounding quotes.
+env_get() {
+  [ -f "$ENV_FILE" ] || { printf '%s' ""; return; }
+  local v
+  v=$(grep -E "^[[:space:]]*$1=" "$ENV_FILE" 2>/dev/null | tail -n1 | cut -d= -f2- || true)
+  v="${v%\"}"; v="${v#\"}"; v="${v%\'}"; v="${v#\'}"
+  printf '%s' "$v"
+}
+
+# Set a key, replacing an existing (or commented-out) definition in place so the
+# surrounding comments stay where the user expects them. Appends if absent.
+env_set() {
+  local key="$1" val="$2" tmp
+  tmp=$(mktemp)
+  if grep -qE "^[[:space:]]*#?[[:space:]]*$key=" "$ENV_FILE"; then
+    KEY="$key" VAL="$val" awk '
+      !done && $0 ~ "^[[:space:]]*#?[[:space:]]*" ENVIRON["KEY"] "=" {
+        print ENVIRON["KEY"] "=" ENVIRON["VAL"]; done=1; next
+      } { print }
+    ' "$ENV_FILE" > "$tmp"
+  else
+    cat "$ENV_FILE" > "$tmp"
+    printf '%s=%s\n' "$key" "$val" >> "$tmp"
+  fi
+  cat "$tmp" > "$ENV_FILE"
+  rm -f "$tmp"
+}
+
+# --- mode --------------------------------------------------------------------
+# Compose reads COMPOSE_PROFILES from .env on its own; an explicit mode argument
+# overrides it for this invocation only.
+MODE_OVERRIDE=""
+profile_args() {
+  local profiles="${MODE_OVERRIDE:-$(env_get COMPOSE_PROFILES)}"
+  profiles="${profiles:-local}"
+  local out=() p
+  local IFS=,
+  for p in $profiles; do
+    p="$(printf '%s' "$p" | tr -d '[:space:]')"
+    [ -n "$p" ] && out+=(--profile "$p")
+  done
+  printf '%s\n' "${out[@]:-}"
+}
+# Every profile at once. Used by down/ps/logs/restart so a stack started in one
+# mode is still fully seen (and fully torn down) from another.
+dca() { dc --profile local --profile lan --profile public --profile db "$@"; }
+
+dcp() {
+  local args=() line
+  while IFS= read -r line; do [ -n "$line" ] && args+=("$line"); done < <(profile_args)
+  if [ -n "$MODE_OVERRIDE" ]; then
+    COMPOSE_PROFILES="$MODE_OVERRIDE" dc "${args[@]}" "$@"
+  else
+    dc "${args[@]}" "$@"
+  fi
+}
+current_mode() {
+  local p="${MODE_OVERRIDE:-$(env_get COMPOSE_PROFILES)}"
+  printf '%s' "${p:-local}"
+}
+mode_has() { case ",$(current_mode)," in *",$1,"*) return 0;; *) return 1;; esac; }
+
+# --- network -----------------------------------------------------------------
+lan_ips() {
+  if have ip; then
+    ip -4 -o addr show scope global 2>/dev/null | awk '{split($4,a,"/"); print a[1]}'
+  elif have ifconfig; then
+    ifconfig 2>/dev/null | awk '/inet /{print $2}' | sed 's/addr://'
+  elif have ipconfig; then
+    ipconfig 2>/dev/null | tr -d '\r' | awk -F': ' '/IPv4 Address/{print $2}'
+  fi | grep -Ev '^(127\.|169\.254\.|0\.0\.0\.0$)' || true
+}
+
+# --- commands ----------------------------------------------------------------
+
+cmd_init() {
+  if [ -f "$ENV_FILE" ]; then
+    warn ".env already exists - leaving it alone."
+  else
+    cp .env.example "$ENV_FILE"
+    ok "Created .env from .env.example"
+  fi
+  [ -f "$AUTH_FILE" ] || die "caddy/auth.conf.example is missing - re-clone the repo."
+  say ""
+  say "Next:"
+  say "  1. ${B}./archon auth claude${X}    give Archon your Claude credentials"
+  say "  2. ${B}./archon auth github${X}    (optional) reuse your gh login"
+  say "  3. edit ${B}.env${X}               set GITHUB_ALLOWED_USERS and the mode"
+  say "  4. ${B}./archon up${X}             start it"
+}
+
+# Archon expands $VAR only inside an MCP config's `headers` and `env` — never
+# inside `url` (packages/providers/src/mcp/config.ts has no url branch). So a
+# query parameter like Supabase's project_ref cannot be a $VAR: it would reach
+# the server as the literal string and fail as a confusing 4xx that reads like
+# a bad token. Rather than make you maintain the ref inside a committed JSON
+# file, render the URL here from .env into a gitignored *.local.json.
+#
+# The token deliberately stays a $VAR. It lives in `headers`, which Archon does
+# expand at run time, so no secret is ever written to a file on disk.
+#
+# No comment marker inside the JSON: Archon reads every top-level key as a
+# server name, so a "_generated" note would fail validation as a server whose
+# config is a string.
+render_mcp_local() {
+  [ -f "$ENV_FILE" ] || return 0
+  local ref query
+  ref="$(env_get SUPABASE_PROJECT_REF)"
+  query='read_only=true'
+  [ "$(env_get SUPABASE_READ_ONLY)" = "false" ] && query=''
+  [ -n "$ref" ] && query="project_ref=${ref}${query:+&$query}"
+
+  cat > "mcp/supabase.local.json" <<EOF
+{
+  "supabase": {
+    "type": "http",
+    "url": "https://mcp.supabase.com/mcp${query:+?$query}",
+    "headers": {
+      "Authorization": "Bearer \$SUPABASE_ACCESS_TOKEN"
+    }
+  }
+}
+EOF
+}
+
+cmd_up() {
+  require_docker; require_env
+  local mode; mode="$(current_mode)"
+
+  [ -n "$(env_get CLAUDE_CODE_OAUTH_TOKEN)" ] || [ -n "$(env_get CLAUDE_API_KEY)" ] || \
+    die "No Claude credentials. Run '${B}./archon auth claude${X}' (or set CLAUDE_API_KEY in .env)."
+
+  if mode_has public; then
+    local d; d="$(env_get DOMAIN)"
+    [ -n "$d" ] && [ "$d" != "archon.example.com" ] || \
+      die "public mode needs a real DOMAIN in .env, with its DNS A record pointing here."
+  fi
+  if mode_has lan || mode_has public; then
+    if ! grep -q '^[[:space:]]*basic_auth' "$AUTH_FILE" 2>/dev/null; then
+      warn "No password set - anyone who can reach this machine gets full control of your agent."
+      warn "Fix with: ${B}./archon password 'some-strong-password'${X}"
+    fi
+  fi
+
+  # Persist the mode so down/logs/status/doctor all act on what is really
+  # running. Without this, `./archon down` after `./archon up lan` would leave
+  # the gateway container behind.
+  if [ -n "$MODE_OVERRIDE" ] && [ "$MODE_OVERRIDE" != "$(env_get COMPOSE_PROFILES)" ]; then
+    env_set COMPOSE_PROFILES "$MODE_OVERRIDE"
+    say "${DIM}mode: ${mode}  (saved to .env)${X}"
+  else
+    say "${DIM}mode: ${mode}${X}"
+  fi
+  render_mcp_local
+  dcp up -d --remove-orphans
+  say ""
+  cmd_ip
+}
+
+cmd_down()    { require_docker; dca down --remove-orphans "$@"; }
+# `docker compose restart` restarts a container with the environment it was
+# CREATED with - it never re-reads env_file. So a credential added to .env would
+# silently not reach the container, and an MCP server would fail to authenticate
+# with everything on disk looking correct. Recreate instead, so "change .env then
+# restart" actually works. Data lives in volumes and is unaffected.
+cmd_restart() {
+  require_docker; require_env; render_mcp_local
+  dcp up -d --force-recreate --remove-orphans "$@"
+}
+cmd_ps()      { require_docker; dca ps; }
+cmd_logs()    { require_docker; dca logs -f --tail=100 "$@"; }
+
+cmd_update() {
+  require_docker; require_env
+  local v; v="$(env_get ARCHON_VERSION)"; v="${v:-latest}"
+  say "Pulling ghcr.io/coleam00/archon:${v} ..."
+  dcp pull
+  dcp up -d --remove-orphans
+  ok "Updated. Data in the archon_data volume is untouched."
+  dcp exec -T app sh -c 'cat /app/package.json 2>/dev/null | grep -m1 \"version\"' 2>/dev/null || true
+}
+
+cmd_ip() {
+  require_env
+  local port lanport mode
+  port="$(env_get PORT)";     port="${port:-3000}"
+  lanport="$(env_get LAN_PORT)"; lanport="${lanport:-8080}"
+  mode="$(current_mode)"
+
+  say "${B}Web UI${X}"
+  say "  this machine   ${C}http://localhost:${port}${X}"
+
+  if mode_has lan; then
+    local bind ips ip
+    bind="$(env_get LAN_BIND)"; bind="${bind:-0.0.0.0}"
+    if [ "$bind" != "0.0.0.0" ] && [ -n "$bind" ]; then
+      say "  teammates      ${C}http://${bind}:${lanport}${X}  ${DIM}(pinned via LAN_BIND)${X}"
+    else
+      ips="$(lan_ips)"
+      if [ -n "$ips" ]; then
+        while IFS= read -r ip; do
+          [ -n "$ip" ] && say "  teammates      ${C}http://${ip}:${lanport}${X}"
+        done <<< "$ips"
+      else
+        say "  teammates      ${DIM}http://<this-machine-ip>:${lanport} (could not detect an IP)${X}"
+      fi
+      say "  ${DIM}Pin one of these as LAN_BIND in .env for a fixed address,${X}"
+      say "  ${DIM}and reserve it for this machine in your router's DHCP settings.${X}"
+    fi
+  fi
+
+  if mode_has public; then
+    local d; d="$(env_get DOMAIN)"
+    say "  teammates      ${C}https://${d}${X}"
+  fi
+
+  if ! mode_has lan && ! mode_has public; then
+    say "  ${DIM}Mode is 'local' - nobody else can reach this.${X}"
+    say "  ${DIM}Share it with: ./archon up lan${X}"
+  fi
+}
+
+# Translate a host path into the container path Archon needs. Nothing in the
+# UI can find a host path, so this is the answer to "Path does not exist".
+cmd_path() {
+  require_env
+  local input="${1:-}"
+  [ -n "$input" ] || die "Usage: ./archon path <host-path-to-your-repo>"
+  local root; root="$(env_get PROJECTS_DIR)"
+  [ -n "$root" ] || die "PROJECTS_DIR is not set in .env - set it to the folder that holds your repos, then ./archon restart"
+
+  # Compare with backslashes, drive-letter case and trailing slashes normalised,
+  # so C:\DEV-KC\app\, C:/dev-kc/app and c:/DEV-KC/app all match.
+  norm() {
+    local s="${1//\\//}"
+    s="$(printf '%s' "$s" | tr 'A-Z' 'a-z')"
+    while [ "${s%/}" != "$s" ]; do s="${s%/}"; done
+    printf '%s' "$s"
+  }
+  local n_in n_root
+  n_in="$(norm "$input")"; n_root="$(norm "$root")"
+
+  if [ "$n_in" = "$n_root" ]; then
+    say "/projects"
+  elif case "$n_in" in "$n_root"/*) true ;; *) false ;; esac; then
+    say "/projects/${n_in#"$n_root"/}"
+  else
+    warn "'$input' is not inside PROJECTS_DIR ($root)."
+    warn "Either move it there, or point PROJECTS_DIR at a parent folder of both."
+    exit 1
+  fi
+}
+
+cmd_projects() {
+  require_env
+  local root; root="$(env_get PROJECTS_DIR)"
+  if [ -z "$root" ]; then
+    warn "PROJECTS_DIR is not set in .env - no host code is visible to Archon."
+    say "${DIM}Set it to the folder holding your repos, then ./archon restart${X}"
+    return 1
+  fi
+  say "${B}Host${X} $root  ${DIM}->${X}  ${B}container${X} /projects"
+  say ""
+  if [ ! -d "$root" ]; then
+    warn "$root does not exist on this machine."
+    return 1
+  fi
+  # Listed from the host, so this works whether or not the stack is running.
+  local found=0 d n
+  for d in "$root"/*/; do
+    [ -d "$d" ] || continue
+    found=1
+    n="$(basename "$d")"
+    if [ -d "$d.git" ]; then say "  /projects/$n   ${DIM}(git repo)${X}"; else say "  /projects/$n"; fi
+  done
+  if [ "$found" = "0" ]; then
+    say "${DIM}  (no folders in $root)${X}"
+  else
+    say ""
+    say "${DIM}Use one of these when adding a codebase in the Web UI.${X}"
+  fi
+}
+
+cmd_shell() { require_docker; dcp exec app bash; }
+
+cmd_exec() {
+  require_docker
+  [ $# -gt 0 ] || die "Usage: ./archon exec <command...>"
+  if [ -t 0 ]; then dcp exec app "$@"; else dcp exec -T app "$@"; fi
+}
+
+# Prove an MCP server is usable from a workflow node, rather than merely
+# reachable. Runs Archon's own config loader + a real MCP handshake inside the
+# container, so the network namespace, the .env expansion and the JSON parsing
+# are all the ones a node actually gets. See mcp/_verify.ts.
+cmd_mcp() {
+  require_docker
+  local name="${1:-}"; shift || true
+  [ -n "$name" ] || die "Usage: ./archon mcp <name|path> [tool] [json-args]
+  e.g. ./archon mcp figma-remote
+       ./archon mcp figma-remote get_metadata '{\"fileKey\":\"...\"}'
+  Names resolve against mcp/; anything with a / is used as-is."
+
+  # A bare name is a file in mcp/. Prefer the tracked <name>.json, and fall
+  # back to a generated <name>.local.json so `./archon mcp supabase` finds the
+  # rendered config without anyone having to remember the suffix.
+  local path="$name" base="${name%.json}"
+  case "$name" in
+    */*) : ;;
+    *)   if [ -f "mcp/${base}.json" ]; then path="/opt/archon-mcp/${base}.json"
+         elif [ -f "mcp/${base}.local.json" ]; then path="/opt/archon-mcp/${base}.local.json"
+         else path="/opt/archon-mcp/${base}.json"; fi ;;
+  esac
+
+  if ! dcp ps --status running --services 2>/dev/null | grep -qx app; then
+    die "Archon is not running. Start it with ./archon up, then retry."
+  fi
+  dcp exec -T app bun /opt/archon-mcp/_verify.ts "$path" "$@"
+}
+
+# Install a shared skill from skills/ into a project's .claude/skills/.
+#
+# Project-local is the only skill root Archon searches in every execution mode:
+# a node running under container isolation skips the user-global root entirely,
+# and the server runs as appuser (not root), so "just mount it into a home
+# directory" resolves differently depending on how the node was launched.
+# Copying into the repo also means the skill is committed and the whole team
+# gets it, which is how Claude skills are meant to be shared.
+cmd_skill() {
+  local target="${1:-}" name="${2:-}"
+  [ -n "$target" ] || die "Usage: ./archon skill <project> [skill-name]
+  ./archon skill kc-bud                       # every skill in skills/
+  ./archon skill kc-bud figma-design-to-code  # just this one
+  <project> is a folder under PROJECTS_DIR, or any absolute path."
+
+  local root dest
+  if [ -d "$target" ]; then
+    root="$target"
+  else
+    local base; base="$(env_get PROJECTS_DIR)"
+    [ -n "$base" ] || die "PROJECTS_DIR is not set in .env, so '$target' cannot be resolved."
+    root="$base/$target"
+    [ -d "$root" ] || die "No such project: $root"
+  fi
+
+  dest="$root/.claude/skills"
+  mkdir -p "$dest" || die "Could not create $dest"
+
+  local n=0
+  for src in skills/*/; do
+    [ -d "$src" ] || continue
+    local sname; sname="$(basename "$src")"
+    [ -z "$name" ] || [ "$sname" = "$name" ] || continue
+    [ -f "$src/SKILL.md" ] || { warn "skipping $sname - no SKILL.md"; continue; }
+    rm -rf "$dest/$sname"
+    cp -r "$src" "$dest/$sname"
+    ok "$sname -> $dest/$sname"
+    n=$((n+1))
+  done
+
+  [ "$n" -gt 0 ] || die "No skill copied. Check the name against: $(ls -m skills 2>/dev/null)"
+  say ""
+  say "${DIM}Reference it from a node as:  skills: [${name:-<name>}]${X}"
+  say "${DIM}Commit .claude/skills/ so your team gets it too.${X}"
+}
+
+cmd_auth() {
+  require_env
+  case "${1:-}" in
+    claude)
+      have claude || die "Claude Code is not installed on this machine.
+Install it (curl -fsSL https://claude.ai/install.sh | bash), or paste a key into
+.env manually: CLAUDE_API_KEY=sk-ant-... from console.anthropic.com/settings/keys"
+      say "Running ${B}claude setup-token${X} - approve in the browser when prompted."
+      say "${DIM}This mints a long-lived token billed to your Claude subscription.${X}"
+      say ""
+      local token
+      token="$(claude setup-token | tr -d '\r\n' | grep -oE 'sk-ant-[A-Za-z0-9_-]+' | tail -n1 || true)"
+      [ -n "$token" ] || die "Could not read a token from 'claude setup-token'. Run it yourself and paste the value into CLAUDE_CODE_OAUTH_TOKEN in .env."
+      env_set CLAUDE_CODE_OAUTH_TOKEN "$token"
+      ok "Wrote CLAUDE_CODE_OAUTH_TOKEN to .env (${token:0:14}...)"
+      say "${DIM}Apply it with: ./archon restart${X}"
+      ;;
+    github)
+      have gh || die "The GitHub CLI is not installed. Install it from https://cli.github.com/, or paste a token into GH_TOKEN and GITHUB_TOKEN in .env."
+      local token
+      token="$(gh auth token 2>/dev/null | tr -d '\r\n' || true)"
+      [ -n "$token" ] || die "Not logged in. Run '${B}gh auth login${X}' first."
+      env_set GH_TOKEN "$token"
+      env_set GITHUB_TOKEN "$token"
+      ok "Wrote GH_TOKEN and GITHUB_TOKEN to .env"
+      local me; me="$(gh api user --jq .login 2>/dev/null || true)"
+      if [ -n "$me" ] && [ -z "$(env_get GITHUB_ALLOWED_USERS)" ]; then
+        env_set GITHUB_ALLOWED_USERS "$me"
+        ok "Set GITHUB_ALLOWED_USERS=$me - add teammates as a comma-separated list."
+      fi
+      say "${DIM}Apply it with: ./archon restart${X}"
+      ;;
+    *)
+      die "Usage: ./archon auth claude | github"
+      ;;
+  esac
+}
+
+cmd_password() {
+  require_docker
+  local pw="${1:-}" user="${2:-team}"
+  [ -n "$pw" ] || die "Usage: ./archon password '<password>' [username]   (default username: team)"
+  local hash
+  hash="$(docker run --rm caddy:2-alpine caddy hash-password --plaintext "$pw" 2>/dev/null | tr -d '\r\n')"
+  [ -n "$hash" ] || die "Failed to generate a password hash."
+  cat > "$AUTH_FILE" <<EOF
+# Archon Web UI password gate - imported by both Caddyfiles.
+# GENERATED by './archon password'. Do not hand-edit; re-run the command instead.
+#
+# Username: ${user}
+# The value below is a bcrypt hash, not a plaintext password - but it is still
+# a credential. Do not commit this file to a public repository.
+
+@protected not path /webhooks/* /api/health /internal/*
+basic_auth @protected {
+	${user} ${hash}
+}
+EOF
+  ok "Password set for user '${B}${user}${X}'"
+  # Reload only the gateway that is actually up, so this works in any mode.
+  local running
+  running="$(dca ps --services --filter status=running 2>/dev/null | grep '^caddy-' || true)"
+  if [ -n "$running" ]; then
+    # shellcheck disable=SC2086
+    dca restart $running >/dev/null 2>&1 && ok "Gateway reloaded"
+  else
+    say "${DIM}Takes effect on the next ./archon up${X}"
+  fi
+}
+
+cmd_nopassword() {
+  cat > "$AUTH_FILE" <<'EOF'
+# Archon Web UI password gate - imported by both Caddyfiles.
+#
+# This file is EMPTY, which means NO PASSWORD is required.
+# Generate a real gate with:  ./archon password '<password>'
+EOF
+  warn "Password removed - the Web UI is now open to anyone who can reach it."
+}
+
+cmd_secret() {
+  local kind="${1:-b64}"
+  if have openssl; then
+    case "$kind" in
+      hex) openssl rand -hex 32 ;;
+      *)   openssl rand -base64 32 ;;
+    esac
+  elif have python3; then
+    case "$kind" in
+      hex) python3 -c 'import secrets;print(secrets.token_hex(32))' ;;
+      *)   python3 -c 'import secrets,base64;print(base64.b64encode(secrets.token_bytes(32)).decode())' ;;
+    esac
+  else
+    docker run --rm alpine sh -c "head -c32 /dev/urandom | od -An -tx1 | tr -d ' \n'; echo"
+  fi
+}
+
+cmd_build() {
+  require_docker; require_env
+  [ -f Dockerfile.user ] || die "Dockerfile.user is missing - re-clone the repo."
+  # Only the image NAME changes; ARCHON_VERSION keeps naming the upstream
+  # release it is built from, so running this twice stays correct.
+  local v; v="$(env_get ARCHON_VERSION)"; v="${v:-latest}"
+  case "$v" in local) v=latest; env_set ARCHON_VERSION latest ;; esac
+  say "Building archon-portable:${v} on ghcr.io/coleam00/archon:${v} (adds Node LTS for npx-based MCP servers)..."
+  docker build -f Dockerfile.user -t "archon-portable:${v}" --build-arg "ARCHON_VERSION=${v}" .
+  env_set ARCHON_IMAGE "archon-portable"
+  ok "Built archon-portable:${v} and pointed .env at it."
+  say "${DIM}Start it with: ./archon up${X}"
+  say "${DIM}Rebuild after an upstream release with: ./archon build${X}"
+  say "${DIM}Go back to the stock image by setting ARCHON_IMAGE=ghcr.io/coleam00/archon in .env.${X}"
+}
+
+cmd_doctor() {
+  local fail=0
+  say "${B}Archon Portable - preflight${X}"
+  say ""
+
+  if have docker && docker info >/dev/null 2>&1; then
+    ok "Docker daemon reachable ($(docker version --format '{{.Server.Version}}' 2>/dev/null))"
+  else
+    say "${R}✗${X} Docker daemon not reachable"; fail=1
+  fi
+
+  if dc version >/dev/null 2>&1; then ok "Docker Compose available"
+  else say "${R}✗${X} Docker Compose missing"; fail=1; fi
+
+  if [ -f "$ENV_FILE" ]; then ok ".env present"
+  else say "${R}✗${X} .env missing - run ./archon init"; fail=1; fi
+
+  if [ -f "$ENV_FILE" ]; then
+    if [ -n "$(env_get CLAUDE_CODE_OAUTH_TOKEN)" ]; then ok "Claude: OAuth token set (subscription billing)"
+    elif [ -n "$(env_get CLAUDE_API_KEY)" ]; then ok "Claude: API key set (metered billing)"
+    else say "${R}✗${X} Claude: no credentials - run ./archon auth claude"; fail=1; fi
+
+    if [ "$(env_get CLAUDE_USE_GLOBAL_AUTH)" = "true" ]; then
+      warn "CLAUDE_USE_GLOBAL_AUTH=true has no effect in Docker - remove it to avoid confusion."
+    fi
+
+    if [ -n "$(env_get GH_TOKEN)" ]; then
+      if [ -n "$(env_get GITHUB_ALLOWED_USERS)" ]; then
+        ok "GitHub: PAT set, restricted to [$(env_get GITHUB_ALLOWED_USERS)]"
+      else
+        warn "GitHub: PAT set but GITHUB_ALLOWED_USERS is empty - ANY GitHub user can trigger workflows."
+      fi
+    fi
+    if [ -n "$(env_get GITHUB_APP_ID)" ]; then
+      if [ -n "$(env_get GH_TOKEN)" ]; then
+        say "${R}✗${X} GitHub: both PAT and App mode configured - Archon will refuse to start. Pick one."; fail=1
+      fi
+      if [ "$(env_get ARCHON_ALLOW_INTERNAL_ON_PUBLIC_BIND)" != "1" ]; then
+        say "${R}✗${X} GitHub App mode needs ARCHON_ALLOW_INTERNAL_ON_PUBLIC_BIND=1 in this stack (see .env comments)."; fail=1
+      fi
+    fi
+
+    local mode; mode="$(current_mode)"
+    ok "Mode: ${mode}"
+    if mode_has lan || mode_has public; then
+      if grep -q '^[[:space:]]*basic_auth' "$AUTH_FILE" 2>/dev/null; then ok "Web UI password gate: enabled"
+      else warn "Web UI password gate: OFF while exposing the UI - run ./archon password '<password>'"; fi
+    fi
+    if mode_has public; then
+      local d; d="$(env_get DOMAIN)"
+      if [ -n "$d" ] && [ "$d" != "archon.example.com" ]; then ok "DOMAIN: $d"
+      else say "${R}✗${X} public mode requires a real DOMAIN in .env"; fail=1; fi
+    fi
+    local pdir; pdir="$(env_get PROJECTS_DIR)"
+    if [ -z "$pdir" ]; then
+      warn "PROJECTS_DIR is unset - Archon cannot see any code on this machine. Adding a local codebase will fail with 'Path does not exist'."
+    elif [ -d "$pdir" ]; then
+      ok "Local code: $pdir -> /projects"
+    else
+      say "${R}✗${X} PROJECTS_DIR points at '$pdir', which does not exist on this machine."; fail=1
+    fi
+
+    if [ "$(env_get ARCHON_APP_BIND)" = "0.0.0.0" ]; then
+      warn "ARCHON_APP_BIND=0.0.0.0 publishes Archon to the network with NO authentication. Use lan mode instead."
+    fi
+  fi
+
+  case "$(uname -s 2>/dev/null || echo unknown)" in
+    Darwin)
+      if [ -n "$(env_get ARCHON_DATA)" ] && [ "$(env_get ARCHON_ALLOW_ROOT_FALLBACK)" != "1" ]; then
+        warn "macOS + ARCHON_DATA bind mount: the container will fail to fix ownership. Set ARCHON_ALLOW_ROOT_FALLBACK=1 or unset ARCHON_DATA."
+      fi ;;
+  esac
+
+  if [ -f docker-compose.yml ]; then
+    if dcp config -q >/dev/null 2>&1; then ok "docker-compose.yml is valid"
+    else say "${R}✗${X} docker-compose.yml failed validation:"; dcp config -q 2>&1 | sed 's/^/    /'; fail=1; fi
+  fi
+
+  say ""
+  [ "$fail" -eq 0 ] && ok "Ready. Start with ./archon up" || die "Fix the items above, then re-run ./archon doctor"
+}
+
+cmd_help() {
+  cat <<EOF
+${B}Archon Portable${X} - a fully configured Archon on any machine with Docker.
+
+${B}Setup${X}
+  ./archon init                    create .env from the template
+  ./archon auth claude             mint a Claude token and store it in .env
+  ./archon auth github             copy your gh CLI token into .env
+  ./archon password '<pw>' [user]  set the Web UI password (default user: team)
+  ./archon nopassword              remove the Web UI password
+  ./archon secret [hex]            print a random secret for WEBHOOK_SECRET etc.
+  ./archon doctor                  check the configuration before starting
+
+${B}Run${X}
+  ./archon up [mode]               start (mode: local | lan | public, +,db)
+  ./archon down                    stop, keeping all data
+  ./archon down -v                 stop and DELETE all data
+  ./archon restart [service]       restart
+  ./archon status                  container status
+  ./archon logs [service]          follow logs
+  ./archon update                  pull a newer Archon image and recreate
+  ./archon ip                      show the URLs to share with teammates
+  ./archon projects                list the local repos Archon can see
+  ./archon path <host-path>        translate a host path to its container path
+
+${B}Inside the container${X}
+  ./archon shell                   interactive bash
+  ./archon exec <cmd...>           run one command
+  ./archon build                   rebuild the image with Node LTS added
+  ./archon mcp <name> [tool]       verify an MCP server: handshake + list tools
+  ./archon skill <project>         install skills/ into a project's .claude/skills
+
+${B}Modes${X}
+  local    Web UI on 127.0.0.1 only. The default.
+  lan      Web UI on your LAN IP behind a password (LAN_PORT, default 8080).
+  public   Web UI on DOMAIN with automatic HTTPS.
+  Add ,db for PostgreSQL, e.g. ./archon up lan,db
+
+Configuration lives in ${B}.env${X}; the mode is COMPOSE_PROFILES there.
+EOF
+}
+
+# --- dispatch ----------------------------------------------------------------
+cmd="${1:-help}"; shift || true
+
+case "$cmd" in
+  up)
+    case "${1:-}" in local|lan|public|db|*,*) MODE_OVERRIDE="$1"; shift ;; esac
+    cmd_up "$@" ;;
+  init)              cmd_init "$@" ;;
+  down)              cmd_down "$@" ;;
+  restart)           cmd_restart "$@" ;;
+  status|ps)         cmd_ps "$@" ;;
+  logs)              cmd_logs "$@" ;;
+  update|upgrade)    cmd_update "$@" ;;
+  ip|url|urls)       cmd_ip "$@" ;;
+  path)              cmd_path "$@" ;;
+  projects)          cmd_projects "$@" ;;
+  shell|bash|sh)     cmd_shell "$@" ;;
+  exec)              cmd_exec "$@" ;;
+  mcp)               cmd_mcp "$@" ;;
+  skill|skills)      cmd_skill "$@" ;;
+  auth)              cmd_auth "$@" ;;
+  password|passwd)   cmd_password "$@" ;;
+  nopassword)        cmd_nopassword "$@" ;;
+  secret)            cmd_secret "$@" ;;
+  build)             cmd_build "$@" ;;
+  doctor|check)      cmd_doctor "$@" ;;
+  help|-h|--help)    cmd_help ;;
+  *)                 die "Unknown command '$cmd'. Try ./archon help" ;;
+esac

@@ -1,0 +1,15 @@
+# The launcher and anything Docker copies into a Linux container must keep LF
+# endings. Without this, a Windows checkout with core.autocrlf=true produces
+# CRLF and the container fails with "no such file or directory" on exec.
+*           text=auto eol=lf
+archon      text eol=lf
+*.sh        text eol=lf
+*.yml       text eol=lf
+*.json      text eol=lf
+Dockerfile* text eol=lf
+Caddyfile*  text eol=lf
+*.conf      text eol=lf
+
+# PowerShell is happiest with CRLF on Windows.
+*.ps1       text eol=crlf
+*.cmd       text eol=crlf
